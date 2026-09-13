@@ -99,7 +99,7 @@ def scales_lrsr_1dos(S: torch.Tensor) -> Tuple[torch.Tensor, int]:
 
 def scales_lrsr_kmeans(S: torch.Tensor) -> Tuple[torch.Tensor, List[int]]:
     """Constrained K-Means over out-feature columns, one low-rank per cluster."""
-    model = KMeansClusterization(distance_fn=compute_pairwise_angular_distances, tolerance=TOLERANCE)
+    model = KMeansClusterization(tolerance=TOLERANCE)
     model.fit(S)
     labels = model.predict(CLUSTERS)
 

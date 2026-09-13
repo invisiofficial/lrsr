@@ -1,24 +1,23 @@
 import torch
 import numpy as np
-from scipy.optimize import linprog
-from sklearn.cluster import KMeans
-from typing import Callable, Optional
+from typing import Optional
+from k_means_constrained import KMeansConstrained
 
 from .data_clusterization import DataClusterization
 
 
 class KMeansClusterization(DataClusterization):
-    """Constrained K-Means clustering using Min-Cost Flow LP."""
+    """Constrained K-Means clustering."""
 
     def __init__(
         self,
-        distance_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
         tolerance: float = 0.01,
         max_iter: int = 20,
+        n_init: int = 5,
     ):
         self.tolerance = tolerance
         self.max_iter = max_iter
-        self.distance_fn = distance_fn
+        self.n_init = n_init
         self.data_: Optional[torch.Tensor] = None
 
     def fit(self, data: torch.Tensor):
@@ -43,59 +42,22 @@ class KMeansClusterization(DataClusterization):
         if size_max * num_clusters < num_vectors:
             size_max = num_vectors // num_clusters + 1
 
-        # Initialize centroids
-        data_np = self.data_.cpu().numpy()
-        kmeans = KMeans(n_clusters=num_clusters, random_state=0, n_init=10)
-        kmeans.fit(data_np.T)
-        centroids = torch.tensor(kmeans.cluster_centers_.T, dtype=self.data_.dtype, device=self.data_.device)
-        centroids = centroids / (torch.norm(centroids, dim=0, keepdim=True) + 1e-12)
+        data_np = self.data_.detach().cpu().numpy().T
 
-        labels = np.full(num_vectors, -1, dtype=int)
+        # Compute L2 normalization
+        norms = np.linalg.norm(data_np, axis=1, keepdims=True)
+        data_np = np.divide(data_np, norms, out=np.zeros_like(data_np), where=norms!=0)
 
-        for _ in range(self.max_iter):
-            # E-step: Pairwise distances of shape (num_vectors, num_clusters)
-            cost_matrix = self.distance_fn(self.data_, centroids).cpu().numpy()
-            c = cost_matrix.flatten().astype(np.float64)
-            n_vars = num_vectors * num_clusters
+        # Initialize clusterization
+        kmeans = KMeansConstrained(
+            n_clusters=num_clusters,
+            size_min=size_min,
+            size_max=size_max,
+            max_iter=self.max_iter,
+            n_init=self.n_init,
+            random_state=0,
+        )
 
-            # Equality constraints: Each vector is assigned to exactly one cluster
-            A_eq = np.zeros((num_vectors, n_vars), dtype=np.float64)
-            b_eq = np.ones(num_vectors, dtype=np.float64)
-            for i in range(num_vectors):
-                A_eq[i, i * num_clusters : (i + 1) * num_clusters] = 1.0
-
-            # Inequality constraints: Cluster size bounds [size_min, size_max]
-            A_ub = np.zeros((2 * num_clusters, n_vars), dtype=np.float64)
-            b_ub = np.zeros(2 * num_clusters, dtype=np.float64)
-
-            for k in range(num_clusters):
-                indices = np.arange(k, n_vars, num_clusters)
-                A_ub[k, indices] = -1.0
-                b_ub[k] = -size_min
-                A_ub[num_clusters + k, indices] = 1.0
-                b_ub[num_clusters + k] = size_max
-
-            bounds = [(0.0, 1.0)] * n_vars
-
-            # Solve assignment LP via HiGHS solver
-            result = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method="highs")
-
-            if result.success:
-                x = result.x.reshape(num_vectors, num_clusters)
-                new_labels = np.argmax(np.round(x, decimals=5), axis=1)
-            else:
-                new_labels = np.argmin(cost_matrix, axis=1)
-
-            if np.array_equal(labels, new_labels):
-                break
-            labels = new_labels
-
-            # M-step: Update and re-normalize centroids
-            for c_idx in range(num_clusters):
-                mask = torch.from_numpy(labels == c_idx).to(self.data_.device)
-                cluster_points = self.data_[:, mask]
-                if cluster_points.shape[1] > 0:
-                    new_c = torch.mean(cluster_points, dim=1)
-                    centroids[:, c_idx] = new_c / (torch.norm(new_c) + 1e-12)
-
+        # Compute clusters
+        labels = kmeans.fit_predict(data_np)
         return labels
