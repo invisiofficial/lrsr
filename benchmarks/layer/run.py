@@ -5,11 +5,8 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-from lrsr.metrics import compute_pairwise_angular_distances, compute_median_angular_distances, mse
-from lrsr.utils import compute_otsu_threshold
-from lrsr.decomposition.alternating_decomposition import AlternatingDecomposition
-from lrsr.approximation.rank_approximation import RankApproximation
-from lrsr.clusterization.kmeans_clusterization import KMeansClusterization
+from lrsr.metrics import mse
+from e2e.layer import quantize_layer
 
 
 #region Configuration
@@ -31,8 +28,6 @@ GAPS = ["lrsr-naive", "lrsr-1dos", "lrsr-kmeans"]
 EPS = 1e-7
 
 #endregion
-
-approximator = RankApproximation(AlternatingDecomposition(num_iterations=20))
 
 def show_plan(files: int, device: str) -> None:
     """Prints the benchmark plan."""
@@ -63,59 +58,22 @@ def summarize_method(records: List[dict]) -> List[dict]:
         })
     return rows
 
-#region Quantization
+#region Helpers
 
-def quantize_tensor(W: torch.Tensor, S: torch.Tensor) -> torch.Tensor:
-    """Quantizes W with scales S and dequantizes back to float."""
-    return torch.clamp(torch.round(W / S), -QMAX, QMAX) * S
-
-def scales_per_channel(W: torch.Tensor) -> torch.Tensor:
-    """Per-channel scales: one per out-feature column."""
-    return torch.clamp(W.abs().max(dim=0, keepdim=True)[0] / QMAX, min=EPS)
-
-def scales_per_group(W: torch.Tensor) -> torch.Tensor:
-    """Per-group scales over the in-feature axis, group size GROUP."""
-    n, p = W.shape
-    G = W.view(n // GROUP, GROUP, p)
-    return torch.clamp(G.abs().max(dim=1)[0] / QMAX, min=EPS).repeat_interleave(GROUP, dim=0)
-
-def scales_lrsr_naive(S: torch.Tensor) -> torch.Tensor:
-    """One low-rank approximation of the full scale matrix."""
-    return torch.clamp(approximator.approximate(S, rank=1), min=EPS)
-
-def scales_lrsr_1dos(S: torch.Tensor) -> Tuple[torch.Tensor, int]:
-    """Two low-rank blocks split by threshold on distance of out-feature columns."""
-    dist = compute_median_angular_distances(S)
-    tau = compute_otsu_threshold(dist.cpu().numpy())
-    idx_minor = np.where(dist.cpu().numpy() > tau)[0]
-    idx_main = np.where(dist.cpu().numpy() <= tau)[0]
-
-    out = torch.zeros_like(S)
-    if len(idx_main) > 0:
-        out[:, idx_main] = torch.clamp(approximator.approximate(S[:, idx_main], rank=1), min=EPS)
-    if len(idx_minor) > 0:
-        out[:, idx_minor] = torch.clamp(approximator.approximate(S[:, idx_minor], rank=1), min=EPS)
-    return out, len(idx_minor)
-
-def scales_lrsr_kmeans(S: torch.Tensor) -> Tuple[torch.Tensor, List[int]]:
-    """Constrained K-Means over out-feature columns, one low-rank per cluster."""
-    model = KMeansClusterization(tolerance=TOLERANCE)
-    model.fit(S)
-    labels = model.predict(CLUSTERS)
-
-    out = torch.zeros_like(S)
-    sizes = []
-    for c in range(CLUSTERS):
-        idx = np.where(labels == c)[0]
-        sizes.append(len(idx))
-        if len(idx) == 0:
-            continue
-        out[:, idx] = torch.clamp(approximator.approximate(S[:, idx], rank=1), min=EPS)
-    return out, sizes
-
-def compute_nmse(A: torch.Tensor, W: torch.Tensor, S: torch.Tensor, Y: torch.Tensor) -> float:
+def compute_nmse(A: torch.Tensor, W: torch.Tensor, Y: torch.Tensor, method: str) -> float:
     """Normalized MSE of the matmul: mse(A @ W_q, Y) / var(Y)."""
-    Y_q = A @ quantize_tensor(W, S)
+    base_layer = torch.nn.Linear(W.size(0), W.size(1), bias=False, device=W.device, dtype=W.dtype)
+    with torch.no_grad():
+        base_layer.weight.copy_(W.t())
+    quantized_layer = quantize_layer(
+        base_layer,
+        method,
+        bits=BITS,
+        group_size=GROUP,
+        clusters=CLUSTERS,
+        tolerance=TOLERANCE,
+    ).to(W.device)
+    Y_q = quantized_layer(A)
     return mse(Y, Y_q) / torch.var(Y).item()
 
 def compute_gap(nm: Dict[str, float], m: str) -> float:
@@ -192,24 +150,16 @@ def main() -> None:
         A = A.to(device)
         with torch.inference_mode():
             Y = A @ W
-            S = torch.clamp(W.abs() / QMAX, min=EPS)
-
-            nm = {
-                "per-channel": compute_nmse(A, W, scales_per_channel(W), Y),
-                "per-group": compute_nmse(A, W, scales_per_group(W), Y),
-                "lrsr-naive": compute_nmse(A, W, scales_lrsr_naive(S), Y),
-            }
-            s_1d, n_minor = scales_lrsr_1dos(S)
-            nm["lrsr-1dos"] = compute_nmse(A, W, s_1d, Y)
-            s_km, sizes = scales_lrsr_kmeans(S)
-            nm["lrsr-kmeans"] = compute_nmse(A, W, s_km, Y)
+            nm = {method: compute_nmse(A, W, Y, method) for method in METHODS}
+            n_minor = 0
+            sizes = []
 
         print(f"  [{i}/{len(files)}] {model} | {layer} | {prompt}: "
               f"pc={nm['per-channel']:.4f} pg={nm['per-group']:.4f} "
               f"naive={nm['lrsr-naive']:.4f} 1d={nm['lrsr-1dos']:.4f} km={nm['lrsr-kmeans']:.4f}")
 
         records.append(record(model, layer, prompt, (n_in, n_out), nm, n_minor, sizes))
-        del W, A, Y, S, s_1d, s_km
+        del W, A, Y
         if device == "cuda":
             torch.cuda.empty_cache()
 
