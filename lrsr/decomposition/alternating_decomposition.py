@@ -5,7 +5,7 @@ from .matrix_decomposition import MatrixDecomposition
 
 
 class AlternatingDecomposition(MatrixDecomposition):
-    """Computes a strictly upper-bounding Rank-1 decomposition (u * v^T >= S) using alternating max-scale updates."""
+    """Computes a strictly upper-bounding Rank-1 decomposition (u * v^T >= S)."""
 
     def __init__(self, num_iterations: int = 20):
         self.num_iterations = num_iterations
@@ -16,18 +16,12 @@ class AlternatingDecomposition(MatrixDecomposition):
             print("Warning: AlternatingDecomposition is strictly formulated for Rank-1. Forcing rank=1.")
 
         S_mat = torch.clamp(matrix, min=1e-7)
-        rows, _ = S_mat.shape
         device = S_mat.device
         dtype = S_mat.dtype
 
-        # Initialize u with ones
-        u = torch.ones(rows, device=device, dtype=dtype)
-
-        # Execute Alternating Optimization
-        for _ in range(self.num_iterations):
-            v = torch.max(S_mat / u.unsqueeze(1), dim=0)[0]
-
-            u = torch.max(S_mat / v.unsqueeze(0), dim=1)[0]
+        # Compute upper-bounding decomposition
+        v = torch.max(S_mat, dim=0)[0]
+        u = torch.max(S_mat / v.unsqueeze(0), dim=1)[0]
 
         # Reshape factors into standard format
         U = u.unsqueeze(1)
