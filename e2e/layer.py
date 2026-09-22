@@ -84,6 +84,10 @@ class QuantizedLinear(nn.Module):
             self.register_buffer("cluster_offsets", torch.cat([counts.new_zeros(1), counts.cumsum(0)]))
             self.weight_q = self.weight_q[order]
             self.output_scale = self.output_scale[order]
+            offsets = self.cluster_offsets.tolist()
+            self.cluster_ranges = [
+                (int(offsets[c]), int(offsets[c + 1])) for c in range(self.input_scales.size(0))
+            ]
 
         self.weight_q = pack_int4(self.weight_q)
 
@@ -244,9 +248,7 @@ class LRSRKMeansQuantizedLinear(QuantizedLinear):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.backend == "cutlass":
             output = torch.empty((*x.shape[:-1], self.weight_q.size(0)), dtype=torch.float16, device=x.device)
-            offsets = self.cluster_offsets
-            for cluster in range(self.input_scales.size(0)):
-                start, end = int(offsets[cluster]), int(offsets[cluster + 1])
+            for cluster, (start, end) in enumerate(self.cluster_ranges):
                 if end > start:
                     self._cutlass_group(x, x * self.input_scales[cluster], self.weight_q[start:end],
                                         output, self.cluster_order[start:end],
