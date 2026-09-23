@@ -19,7 +19,7 @@ RESULT = Path(__file__).resolve().parent / "result" / "results.json"
 DEVICE = "cuda:0"
 
 MODELS = ["Qwen/Qwen3-1.7B", "Qwen/Qwen3-4B"]
-METHODS = ["per-channel", "per-group", "lrsr-naive"]
+METHODS = ["per-channel", "per-group", "lrsr-naive", "lrsr-1dos", "lrsr-kmeans"]
 PHASES = ["prefill", "decode", "e2e"]
 
 PREFILL = 4096

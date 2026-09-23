@@ -77,6 +77,8 @@ class QuantizedLinear(nn.Module):
             self.weight_q = self.weight_q[torch.cat([main_idx, minor_idx])]
             self.output_scale = self.output_scale[torch.cat([main_idx, minor_idx])]
             self.main_count = int(main_idx.numel())
+            self.stream_main = torch.cuda.Stream(device=self.weight_q.device)
+            self.stream_minor = torch.cuda.Stream(device=self.weight_q.device)
         elif isinstance(self, LRSRKMeansQuantizedLinear):
             order = torch.argsort(self.cluster_labels, stable=True)
             counts = torch.bincount(self.cluster_labels, minlength=self.input_scales.size(0))
@@ -88,6 +90,7 @@ class QuantizedLinear(nn.Module):
             self.cluster_ranges = [
                 (int(offsets[c]), int(offsets[c + 1])) for c in range(self.input_scales.size(0))
             ]
+            self.streams = [torch.cuda.Stream(device=self.weight_q.device) for _ in range(self.input_scales.size(0))]
 
         self.weight_q = pack_int4(self.weight_q)
 
@@ -206,10 +209,28 @@ class LRSR1DOSQuantizedLinear(QuantizedLinear):
         if self.backend == "cutlass":
             output = torch.empty((*x.shape[:-1], self.main_count + self.minor_cols.numel()),
                                  dtype=torch.float16, device=x.device)
-            self._cutlass_group(x, x * self.main_input_scale, self.weight_q[:self.main_count],
-                                output, self.main_cols, self.output_scale[:self.main_count])
-            self._cutlass_group(x, x * self.minor_input_scale, self.weight_q[self.main_count:],
-                                output, self.minor_cols, self.output_scale[self.main_count:])
+
+            current_stream = torch.cuda.current_stream(x.device)
+
+            if self.main_count > 0:
+                self.stream_main.wait_stream(current_stream)
+                with torch.cuda.stream(self.stream_main):
+                    x_main = x * self.main_input_scale
+                    self._cutlass_group(x, x_main, self.weight_q[:self.main_count],
+                                        output, self.main_cols, self.output_scale[:self.main_count])
+
+            if self.minor_cols.numel() > 0:
+                self.stream_minor.wait_stream(current_stream)
+                with torch.cuda.stream(self.stream_minor):
+                    x_minor = x * self.minor_input_scale
+                    self._cutlass_group(x, x_minor, self.weight_q[self.main_count:],
+                                        output, self.minor_cols, self.output_scale[self.main_count:])
+
+            if self.main_count > 0:
+                current_stream.wait_stream(self.stream_main)
+            if self.minor_cols.numel() > 0:
+                current_stream.wait_stream(self.stream_minor)
+
             return self._add_bias(output)
         output = torch.empty(*x.shape[:-1], self.weight_q.size(0), device=x.device, dtype=x.dtype)
         main_mask = ~self.minor_mask
@@ -248,11 +269,20 @@ class LRSRKMeansQuantizedLinear(QuantizedLinear):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.backend == "cutlass":
             output = torch.empty((*x.shape[:-1], self.weight_q.size(0)), dtype=torch.float16, device=x.device)
+            current_stream = torch.cuda.current_stream(x.device)
+
             for cluster, (start, end) in enumerate(self.cluster_ranges):
                 if end > start:
-                    self._cutlass_group(x, x * self.input_scales[cluster], self.weight_q[start:end],
-                                        output, self.cluster_order[start:end],
-                                        self.output_scale[start:end])
+                    self.streams[cluster].wait_stream(current_stream)
+                    with torch.cuda.stream(self.streams[cluster]):
+                        x_scaled = x * self.input_scales[cluster]
+                        self._cutlass_group(x, x_scaled, self.weight_q[start:end],
+                                            output, self.cluster_order[start:end],
+                                            self.output_scale[start:end])
+
+            for stream in self.streams:
+                current_stream.wait_stream(stream)
+
             return self._add_bias(output)
         output = torch.empty(*x.shape[:-1], self.weight_q.size(0), device=x.device, dtype=x.dtype)
         for cluster in range(self.input_scales.size(0)):
