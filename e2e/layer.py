@@ -166,7 +166,7 @@ class LRSRNaiveQuantizedLinear(QuantizedLinear):
         super().__init__(base_layer, bits)
         W = self._source_weight(base_layer)
         ideal_scales = torch.clamp(W.abs() / self.qmax, min=1e-7)
-        input_scale, output_scale = scales_lrsr_naive(ideal_scales)
+        output_scale, input_scale = scales_lrsr_naive(ideal_scales)
         W_q = torch.clamp(
             torch.round(W / (input_scale.unsqueeze(1) * output_scale.unsqueeze(0))),
             -self.qmax,

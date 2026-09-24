@@ -4,24 +4,21 @@ import torch
 from .matrix_decomposition import MatrixDecomposition
 
 
-class AlternatingDecomposition(MatrixDecomposition):
-    """Computes a strictly upper-bounding Rank-1 decomposition (u * v^T >= S)."""
-
-    def __init__(self, num_iterations: int = 20):
-        self.num_iterations = num_iterations
+class UpperboundingDecomposition(MatrixDecomposition):
+    """Computes a strictly upper-bounding Rank-1 decomposition."""
 
     def decompose(self, matrix: torch.Tensor, rank: int = 1) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Decomposes matrix into U, S, Vh such that outer(U, Vh) >= matrix."""
+        """Decomposes matrix into U, S, Vh such that outer(Vh, U) >= matrix."""
         if rank != 1:
-            print("Warning: AlternatingDecomposition is strictly formulated for Rank-1. Forcing rank=1.")
+            print("Warning: UpperboundingDecomposition is strictly formulated for Rank-1. Forcing rank=1.")
 
         S_mat = torch.clamp(matrix, min=1e-7)
         device = S_mat.device
         dtype = S_mat.dtype
 
         # Compute upper-bounding decomposition
-        v = torch.max(S_mat, dim=0)[0]
-        u = torch.max(S_mat / v.unsqueeze(0), dim=1)[0]
+        u = torch.max(S_mat, dim=0)[0]
+        v = torch.max(S_mat / u.unsqueeze(0), dim=1)[0]
 
         # Reshape factors into standard format
         U = u.unsqueeze(1)

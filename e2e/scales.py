@@ -2,18 +2,18 @@ import torch
 from typing import Tuple
 
 from lrsr.utils import compute_otsu_threshold
-from lrsr.metrics import compute_pairwise_angular_distances, compute_median_angular_distances
-from lrsr.decomposition.alternating_decomposition import AlternatingDecomposition
+from lrsr.metrics import compute_median_angular_distances
+from lrsr.decomposition.upperbounding_decomposition import UpperboundingDecomposition
 from lrsr.approximation.rank_approximation import RankApproximation
 from lrsr.clusterization.kmeans_clusterization import KMeansClusterization
 
 # Global approximator
-rank_approximator = RankApproximation(AlternatingDecomposition(num_iterations=3))
+rank_approximator = RankApproximation(UpperboundingDecomposition())
 
 #region Helpers
 
 def lowrank_factors(S: torch.Tensor, eps: float = 1e-7) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Returns u, v such that outer(u, v) is the low-rank scale matrix."""
+    """Returns u (output-axis) and v (input-axis) of the low-rank scale approximation."""
     U, singular_values, Vh = rank_approximator.decomposition_method.decompose(S, rank=1)
     u = U[:, 0] * singular_values[0]
     v = Vh[0]
@@ -34,28 +34,30 @@ def scales_per_group(W: torch.Tensor, group_size: int, qmax: float, eps: float =
     return torch.clamp(groups.abs().max(dim=1)[0] / qmax, min=eps)
 
 def scales_lrsr_naive(S: torch.Tensor, eps: float = 1e-7) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Returns u, v such that outer(u, v) is the low-rank approximation of S."""
+    """Returns u (output-axis) and v (input-axis) of the low-rank approximation of S."""
     return lowrank_factors(S, eps)
 
 def scales_lrsr_1dos(S: torch.Tensor, eps: float = 1e-7) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Returns u_main, u_minor, v and the minor-feature mask from an threshold split."""
+    """Returns major_input, minor_input, output_scale and the minor-output mask from a threshold split."""
     dist = compute_median_angular_distances(S)
     tau = compute_otsu_threshold(dist.cpu().numpy())
     minor_mask = torch.as_tensor(dist.cpu().numpy() > tau, device=S.device)
-    main_mask = ~minor_mask
+    major_mask = ~minor_mask
 
-    u_main = torch.ones(S.size(0), device=S.device, dtype=S.dtype)
-    v = torch.ones(S.size(1), device=S.device, dtype=S.dtype)
-    if main_mask.any():
-        u_main, v_main = lowrank_factors(S[:, main_mask], eps)
-        v[main_mask] = v_main
+    output_scale = torch.ones(S.size(1), device=S.device, dtype=S.dtype)
+    major_input = torch.ones(S.size(0), device=S.device, dtype=S.dtype)
+    if major_mask.any():
+        u_major, v_major = lowrank_factors(S[:, major_mask], eps)
+        output_scale[major_mask] = u_major
+        major_input = v_major
 
-    u_minor = u_main
+    minor_input = major_input
     if minor_mask.any():
         u_minor, v_minor = lowrank_factors(S[:, minor_mask], eps)
-        v[minor_mask] = v_minor
+        output_scale[minor_mask] = u_minor
+        minor_input = v_minor
 
-    return u_main, u_minor, v, minor_mask
+    return major_input, minor_input, output_scale, minor_mask
 
 def scales_lrsr_kmeans(S: torch.Tensor, clusters: int, tolerance: float, eps: float = 1e-7) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Returns per-cluster input scales, per-feature output scales and feature cluster labels."""
@@ -68,7 +70,7 @@ def scales_lrsr_kmeans(S: torch.Tensor, clusters: int, tolerance: float, eps: fl
     for cluster in range(clusters):
         mask = labels == cluster
         if mask.any():
-            input_scale, cluster_output_scale = lowrank_factors(S[:, mask], eps)
+            cluster_output_scale, input_scale = lowrank_factors(S[:, mask], eps)
             input_scales[cluster] = input_scale
             output_scales[mask] = cluster_output_scale
 
