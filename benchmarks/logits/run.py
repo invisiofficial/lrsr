@@ -1,3 +1,4 @@
+import gc
 import math
 import json
 import torch
@@ -13,17 +14,28 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from e2e.patcher import replace_layers
 
 
+torch.backends.cuda.enable_mem_efficient_sdp(False)
+
 #region Configuration
 
 DIR = Path(__file__).resolve().parent / "data"
 RESULT = Path(__file__).resolve().parent / "result" / "results.json"
-DATASET_PATH = DIR / "wiki.test.raw"
+DATASETS = {
+    "wikitext": DIR / "wiki.test.raw",
+    "c4": DIR / "c4.test.raw",
+}
 
 DEVICE = "cpu"  # "cpu" | "cuda" | "auto"
 
-MODELS = ["Qwen/Qwen3-1.7B", "Qwen/Qwen3-4B"]
+MODELS = [
+    "Qwen/Qwen3-1.7B",
+    "Qwen/Qwen3-4B",
+    "Qwen/Qwen3-8B",
+    "google/gemma-4-E2B",
+    "LiquidAI/LFM2.5-2.6B",
+]
 METHODS = ["per-channel", "per-group", "lrsr-naive", "lrsr-1dos", "lrsr-kmeans"]
-BITS = [4, 8]
+BITS = [4]
 
 CHUNKS = 64
 BATCHES = 512
@@ -73,7 +85,7 @@ def format_bytes(n: float) -> str:
 
 def show_plan(
     device: str,
-    dataset_hash: str,
+    dataset_hashes: Dict[str, str],
     models: List[str],
     bits: List[int],
     methods: List[str],
@@ -85,7 +97,9 @@ def show_plan(
     total = sum(s or 0 for s in sizes.values())
     width = max(len(m) for m in models)
     print(f"\nLogits benchmark plan")
-    print(f"  Dataset:          {DATASET_PATH.name} (SHA256: {dataset_hash[:16]}...)")
+    print("  Datasets:")
+    for ds_name, ds_hash in dataset_hashes.items():
+        print(f"   - {DATASETS[ds_name].name} (SHA256: {ds_hash[:16]}...)")
     print(f"  Results file:     {RESULT}")
     print(f"  Computing device: {device}")
     print(f"  Target models:    {len(models)}")
@@ -193,19 +207,19 @@ def main() -> None:
     chunks = args.chunks
     batch_size = args.batches
 
-    dataset_hash = sha256_file(DATASET_PATH)
-    if not dataset_hash:
-        raise FileNotFoundError(f"Dataset not found at {DATASET_PATH}. Run setup.py first.")
+    dataset_hashes = {}
+    for ds_name, ds_path in DATASETS.items():
+        h = sha256_file(ds_path)
+        if not h:
+            raise FileNotFoundError(f"Dataset not found at {ds_path}. Run setup.py first.")
+        dataset_hashes[ds_name] = h
 
     print("Querying model sizes...")
     sizes = {m: get_size(m) for m in models}
-    show_plan(device, dataset_hash, models, bits_list, methods, chunks, batch_size, sizes)
-
-    with open(DATASET_PATH, "r", encoding="utf-8") as f:
-        text = f.read()
+    show_plan(device, dataset_hashes, models, bits_list, methods, chunks, batch_size, sizes)
 
     config = {
-        "sha256": dataset_hash,
+        "sha256": dataset_hashes,
         "bits": bits_list,
         "chunks": chunks,
         "batches": batch_size,
@@ -219,119 +233,132 @@ def main() -> None:
     if RESULT.exists():
         with open(RESULT, "r") as f:
             out_data = json.load(f)
+        out_data["config"] = config
 
     records = out_data.get("records", [])
 
     print(f"\nRunning benchmark...")
 
-    for model_id in models:
-        print(f"[{model_id}]")
-        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    for dataset_name, dataset_path in DATASETS.items():
+        with open(dataset_path, "r", encoding="utf-8") as f:
+            text = f.read()
 
-        encodings = tokenizer(text, return_tensors="pt")
-        input_ids = encodings.input_ids.squeeze()
+        for model_id in models:
+            print(f"[{model_id} | {dataset_name}]")
+            tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 
-        required_tokens = chunks * batch_size
-        if input_ids.size(0) < required_tokens:
-            print(f"Warning: Dataset too small. Truncating chunks...")
-            actual_chunks = input_ids.size(0) // batch_size
-            input_ids = input_ids[:actual_chunks * batch_size].view(actual_chunks, batch_size)
-        else:
-            input_ids = input_ids[:required_tokens].view(chunks, batch_size)
+            encodings = tokenizer(text, return_tensors="pt")
+            input_ids = encodings.input_ids.squeeze()
 
-        pending = [
-            (bits, method)
-            for bits in bits_list
-            for method in methods
-            if not any(r["model"] == model_id and r["method"] == method and r["bits"] == bits for r in records)
-        ]
-        for bits in bits_list:
-            for method in methods:
-                if (bits, method) not in pending:
-                    print(f"  [Skipped] {method} (INT{bits})")
+            required_tokens = chunks * batch_size
+            if input_ids.size(0) < required_tokens:
+                print(f"Warning: Dataset too small. Truncating chunks...")
+                actual_chunks = input_ids.size(0) // batch_size
+                input_ids = input_ids[:actual_chunks * batch_size].view(actual_chunks, batch_size)
+            else:
+                input_ids = input_ids[:required_tokens].view(chunks, batch_size)
 
-        if not pending:
-            del tokenizer
-            continue
+            pending = [
+                (bits, method)
+                for bits in bits_list
+                for method in methods
+                if not any(
+                    r.get("dataset", "wikitext") == dataset_name
+                    and r["model"] == model_id
+                    and r["method"] == method
+                    and r["bits"] == bits
+                    for r in records
+                )
+            ]
+            for bits in bits_list:
+                for method in methods:
+                    if (bits, method) not in pending:
+                        print(f"  [Skipped] {method} (INT{bits})")
 
-        print("\n  Computing baseline logits...")
-        base_model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            dtype=torch.bfloat16,
-            device_map=device,
-            trust_remote_code=True,
-        ).eval()
-        baseline_logits = []
-        with torch.inference_mode():
-            for i in tqdm(range(input_ids.size(0)), desc="  Evaluating chunks", leave=False):
-                chunk_input = input_ids[i].unsqueeze(0).to(device)
-                baseline_logits.append(base_model(chunk_input).logits.cpu())
-                del chunk_input
+            if not pending:
+                del tokenizer
+                continue
 
-        del base_model
-        if device == "cuda":
-            torch.cuda.empty_cache()
-
-        for bits, method in pending:
-            print(f"\n  Processing {method} (INT{bits})...")
-            quant_model = AutoModelForCausalLM.from_pretrained(
+            print("\n  Computing baseline logits...")
+            base_model = AutoModelForCausalLM.from_pretrained(
                 model_id,
                 dtype=torch.bfloat16,
-                device_map="cpu",
+                device_map="auto" if device == "cuda" else device,
                 trust_remote_code=True,
             ).eval()
-            replace_layers(
-                quant_model,
-                method,
-                TARGET_LAYERS,
-                bits=bits,
-                group_size=GROUP,
-                clusters=CLUSTERS,
-                tolerance=TOLERANCE,
-            )
-            quant_model = quant_model.to(device).eval()
-
-            chunk_metrics = []
+            baseline_logits = []
             with torch.inference_mode():
                 for i in tqdm(range(input_ids.size(0)), desc="  Evaluating chunks", leave=False):
                     chunk_input = input_ids[i].unsqueeze(0).to(device)
-                    labels = chunk_input.clone()
-                    logits_base = baseline_logits[i].to(device)
-                    logits_quant = quant_model(chunk_input).logits
-                    chunk_metrics.append(compute_metrics(logits_base, logits_quant, labels))
-                    del chunk_input, labels, logits_base, logits_quant
+                    baseline_logits.append(base_model(chunk_input).logits.cpu())
+                    del chunk_input
 
-            agg_metrics = {k: float(np.mean([m[k] for m in chunk_metrics])) for k in chunk_metrics[0]}
-            agg_metrics["mean_ppl"]      = math.exp(agg_metrics["mean_nll"])
-            agg_metrics["mean_ppl_base"] = math.exp(agg_metrics["mean_nll_base"])
-            agg_metrics["delta_ppl"]     = agg_metrics["mean_ppl"] - agg_metrics["mean_ppl_base"]
-            del agg_metrics["mean_nll"]
-            del agg_metrics["mean_nll_base"]
-            del agg_metrics["mean_ppl_base"]
-            records.append({
-                "model": model_id,
-                "method": method,
-                "bits": bits,
-                "metrics": agg_metrics,
-            })
-            out_data["records"] = records
-            with open(RESULT, "w") as f:
-                json.dump(out_data, f, indent=2)
-
-            del quant_model
+            del base_model
+            gc.collect()
             if device == "cuda":
                 torch.cuda.empty_cache()
 
-        del baseline_logits, tokenizer
-        if device == "cuda":
-            torch.cuda.empty_cache()
+            for bits, method in pending:
+                print(f"\n  Processing {method} (INT{bits})...")
+                quant_model = AutoModelForCausalLM.from_pretrained(
+                    model_id,
+                    dtype=torch.bfloat16,
+                    device_map="cpu",
+                    trust_remote_code=True,
+                ).eval()
+                replace_layers(
+                    quant_model,
+                    method,
+                    TARGET_LAYERS,
+                    bits=bits,
+                    group_size=GROUP,
+                    clusters=CLUSTERS,
+                    tolerance=TOLERANCE,
+                )
+                quant_model = quant_model.to(device).eval()
+
+                chunk_metrics = []
+                with torch.inference_mode():
+                    for i in tqdm(range(input_ids.size(0)), desc="  Evaluating chunks", leave=False):
+                        chunk_input = input_ids[i].unsqueeze(0).to(device)
+                        labels = chunk_input.clone()
+                        logits_base = baseline_logits[i].to(device)
+                        logits_quant = quant_model(chunk_input).logits
+                        chunk_metrics.append(compute_metrics(logits_base, logits_quant, labels))
+                        del chunk_input, labels, logits_base, logits_quant
+
+                agg_metrics = {k: float(np.mean([m[k] for m in chunk_metrics])) for k in chunk_metrics[0]}
+                agg_metrics["mean_ppl"]      = math.exp(agg_metrics["mean_nll"])
+                agg_metrics["mean_ppl_base"] = math.exp(agg_metrics["mean_nll_base"])
+                agg_metrics["delta_ppl"]     = agg_metrics["mean_ppl"] - agg_metrics["mean_ppl_base"]
+                del agg_metrics["mean_nll"]
+                del agg_metrics["mean_nll_base"]
+                del agg_metrics["mean_ppl_base"]
+                records.append({
+                    "dataset": dataset_name,
+                    "model": model_id,
+                    "method": method,
+                    "bits": bits,
+                    "metrics": agg_metrics,
+                })
+                out_data["records"] = records
+                with open(RESULT, "w") as f:
+                    json.dump(out_data, f, indent=2)
+
+                del quant_model
+                if device == "cuda":
+                    torch.cuda.empty_cache()
+
+            del baseline_logits, tokenizer
+            if device == "cuda":
+                torch.cuda.empty_cache()
 
     print(f"\nBenchmark finished: {len(records)} records.")
 
     if records:
         print(f"\nResults")
         table_rows = [
-            [r["model"].split("/")[-1], r["method"], str(r["bits"]),
+            [r.get("dataset", "wikitext"), r["model"].split("/")[-1], r["method"], str(r["bits"]),
              f"{r['metrics']['mean_ppl']:.4f}",
              f"{r['metrics']['delta_ppl']:.4f}",
              f"{r['metrics']['mean_delta_p']:.3f}%",
@@ -339,7 +366,7 @@ def main() -> None:
              f"{r['metrics']['same_top_1']:.2f}%"]
             for r in records
         ]
-        headers = ["model", "method", "bits", "ppl", "delta_ppl", "delta_p", "kld", "same_top_1"]
+        headers = ["dataset", "model", "method", "bits", "ppl", "delta_ppl", "delta_p", "kld", "same_top_1"]
         print(f"{table(headers, table_rows)}")
 
     print(f"\nResults saved to {RESULT}")
