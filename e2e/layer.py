@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from typing import Type
+from typing import Type, Optional
 
 from e2e.scales import (
     scales_per_channel,
@@ -192,11 +192,17 @@ class LRSRNaiveQuantizedLinear(QuantizedLinear):
 class LRSR1DOSQuantizedLinear(QuantizedLinear):
     """Two low-rank scale approximations selected by output-column partition."""
 
-    def __init__(self, base_layer: nn.Linear, bits: int = 4, **_: object) -> None:
+    def __init__(
+        self,
+        base_layer: nn.Linear,
+        bits: int = 4,
+        partition: Optional[torch.Tensor] = None,
+        **_: object,
+    ) -> None:
         super().__init__(base_layer, bits)
         W = self._source_weight(base_layer)
         ideal_scales = torch.clamp(W.abs() / self.qmax, min=1e-7)
-        main_input, minor_input, output_scale, minor_mask = scales_lrsr_1dos(ideal_scales)
+        main_input, minor_input, output_scale, minor_mask = scales_lrsr_1dos(ideal_scales, minor_mask=partition)
         input_scales = torch.where(minor_mask.unsqueeze(0), minor_input.unsqueeze(1), main_input.unsqueeze(1))
         W_q = torch.clamp(torch.round(W / (input_scales * output_scale.unsqueeze(0))), -self.qmax, self.qmax)
         self._store_weight(W_q)
@@ -250,12 +256,13 @@ class LRSRKMeansQuantizedLinear(QuantizedLinear):
         bits: int = 4,
         clusters: int = 3,
         tolerance: float = 0.05,
+        partition: Optional[torch.Tensor] = None,
         **_: object,
     ) -> None:
         super().__init__(base_layer, bits)
         W = self._source_weight(base_layer)
         ideal_scales = torch.clamp(W.abs() / self.qmax, min=1e-7)
-        input_scales, output_scale, labels = scales_lrsr_kmeans(ideal_scales, clusters, tolerance)
+        input_scales, output_scale, labels = scales_lrsr_kmeans(ideal_scales, clusters, tolerance, labels=partition)
         W_q = torch.clamp(
             torch.round(W / (input_scales[labels].t() * output_scale.unsqueeze(0))),
             -self.qmax,

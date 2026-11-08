@@ -1,5 +1,5 @@
 import torch
-from typing import Tuple
+from typing import Tuple, Optional
 
 from lrsr.utils import compute_otsu_threshold
 from lrsr.metrics import compute_median_angular_distances
@@ -37,11 +37,18 @@ def scales_lrsr_naive(S: torch.Tensor, eps: float = 1e-7) -> Tuple[torch.Tensor,
     """Returns u (output-axis) and v (input-axis) of the low-rank approximation of S."""
     return lowrank_factors(S, eps)
 
-def scales_lrsr_1dos(S: torch.Tensor, eps: float = 1e-7) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def scales_lrsr_1dos(
+    S: torch.Tensor,
+    eps: float = 1e-7,
+    minor_mask: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Returns major_input, minor_input, output_scale and the minor-output mask from a threshold split."""
-    dist = compute_median_angular_distances(S)
-    tau = compute_otsu_threshold(dist.cpu().numpy())
-    minor_mask = torch.as_tensor(dist.cpu().numpy() > tau, device=S.device)
+    if minor_mask is None:
+        dist = compute_median_angular_distances(S)
+        tau = compute_otsu_threshold(dist.cpu().numpy())
+        minor_mask = torch.as_tensor(dist.cpu().numpy() > tau, device=S.device, dtype=torch.bool)
+    else:
+        minor_mask = minor_mask.to(device=S.device, dtype=torch.bool)
     major_mask = ~minor_mask
 
     output_scale = torch.ones(S.size(1), device=S.device, dtype=S.dtype)
@@ -59,11 +66,22 @@ def scales_lrsr_1dos(S: torch.Tensor, eps: float = 1e-7) -> Tuple[torch.Tensor, 
 
     return major_input, minor_input, output_scale, minor_mask
 
-def scales_lrsr_kmeans(S: torch.Tensor, clusters: int, tolerance: float, eps: float = 1e-7) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+def scales_lrsr_kmeans(
+    S: torch.Tensor,
+    clusters: int,
+    tolerance: float,
+    eps: float = 1e-7,
+    labels: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Returns per-cluster input scales, per-feature output scales and feature cluster labels."""
-    model = KMeansClusterization(tolerance=tolerance, max_iter=10, n_init=3)
-    model.fit(S)
-    labels = torch.as_tensor(model.predict(clusters), device=S.device, dtype=torch.long)
+    if labels is None:
+        model = KMeansClusterization(tolerance=tolerance, max_iter=10, n_init=3)
+        model.fit(S)
+        labels = torch.as_tensor(model.predict(clusters), device=S.device, dtype=torch.long)
+    else:
+        labels = labels.to(device=S.device, dtype=torch.long)
+
     input_scales = torch.ones(clusters, S.size(0), device=S.device, dtype=S.dtype)
     output_scales = torch.ones(S.size(1), device=S.device, dtype=S.dtype)
 
