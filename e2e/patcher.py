@@ -2,7 +2,7 @@ import torch.nn as nn
 from tqdm import tqdm
 from typing import List, Tuple
 
-from e2e.cache import LayerCache
+from e2e.cache import PartitionCache, CalibrationCache
 from e2e.layer import quantize_layer
 
 
@@ -28,9 +28,10 @@ def replace_layers(
     use_cache: bool = True,
     **kwargs
 ) -> nn.Module:
-    """Replaces target linear layers."""
+    """Replaces target linear layers, caching partitions and calibration data on disk."""
     targets = _get_layers(module, target_layers)
-    cache = LayerCache(module, method=method, enabled=use_cache, **kwargs)
+    part_cache = PartitionCache(module, method=method, enabled=use_cache, **kwargs)
+    calib_cache = CalibrationCache(module, method=method, targets=targets, enabled=use_cache, **kwargs)
 
     iterator = tqdm(
         targets,
@@ -40,15 +41,22 @@ def replace_layers(
     )
     try:
         for parent, name, full_name, child in iterator:
-            partition = cache.get(full_name)
-            layer = quantize_layer(child, method=method, partition=partition, **kwargs)
+            partition = part_cache.get(full_name)
+            calib = calib_cache.get(full_name)
+            layer = quantize_layer(
+                child,
+                method=method,
+                partition=partition,
+                calib=calib,
+                **kwargs,
+            )
             if partition is None:
                 if hasattr(layer, "minor_mask"):
-                    cache.put(full_name, layer.minor_mask)
+                    part_cache.put(full_name, layer.minor_mask)
                 elif hasattr(layer, "cluster_labels"):
-                    cache.put(full_name, layer.cluster_labels)
+                    part_cache.put(full_name, layer.cluster_labels)
             setattr(parent, name, layer)
     finally:
-        cache.save()
+        part_cache.save()
 
     return module

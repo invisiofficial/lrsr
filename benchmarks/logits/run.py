@@ -34,7 +34,22 @@ MODELS = [
     "google/gemma-4-E2B",
     "LiquidAI/LFM2.5-2.6B",
 ]
-METHODS = ["per-channel", "per-group", "lrsr-naive", "lrsr-1dos", "lrsr-kmeans"]
+METHODS = [
+    "per-channel",
+    "per-group",
+    "lrsr-naive",
+    "lrsr-1dos",
+    "lrsr-kmeans",
+    "quarot-per-channel",
+    "quarot-per-group",
+    "quarot-lrsr-naive",
+    "awq-per-channel",
+    "awq-per-group",
+    "awq-lrsr-naive",
+    "gptq-per-channel",
+    "gptq-per-group",
+    "gptq-lrsr-naive",
+]
 BITS = [4]
 
 CHUNKS = 64
