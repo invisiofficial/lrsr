@@ -1,3 +1,4 @@
+import gc
 import math
 import json
 import torch
@@ -6,7 +7,7 @@ import statistics
 import transformers
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, StaticCache
 
 from e2e.layer import QuantizedLinear
 from e2e.patcher import replace_layers
@@ -18,11 +19,11 @@ RESULT = Path(__file__).resolve().parent / "result" / "results.json"
 
 DEVICE = "cuda:0"
 
-MODELS = ["Qwen/Qwen3-1.7B", "Qwen/Qwen3-4B"]
+MODELS = ["Qwen/Qwen3-1.7B", "Qwen/Qwen3-4B", "Qwen/Qwen3-8B"]
 METHODS = ["per-channel", "per-group", "lrsr-naive", "lrsr-1dos", "lrsr-kmeans"]
 PHASES = ["prefill", "decode", "e2e"]
 
-PREFILL = 4096
+PREFILL = 2048
 DECODE = 128
 WARMUP = 3
 REPEATS = 10
@@ -104,14 +105,32 @@ def distribution(values: List[float]) -> dict:
         "p95": float(percentile(0.95))
     }
 
+def set_cache_length(cache: StaticCache, length: int) -> None:
+    """Sets the internal cumulative_length counter of all StaticCache layers in-place."""
+    if hasattr(cache, "layers"):
+        for layer in cache.layers:
+            if hasattr(layer, "cumulative_length"):
+                if isinstance(layer.cumulative_length, torch.Tensor):
+                    layer.cumulative_length.fill_(length)
+                else:
+                    layer.cumulative_length = length
+
 def measure_phase(
     prefill_graph: torch.cuda.CUDAGraph,
     decode_graph: torch.cuda.CUDAGraph,
+    past_key_values: StaticCache,
+    decode_pos: torch.Tensor,
+    prompt_length: int,
     phase: str,
     decode_tokens: int,
     device: torch.device
 ) -> Tuple[float, float]:
-    """Measures time and memory for a specific phase using static CUDA Graphs."""
+    """Measures time and memory for a specific phase using static CUDA Graphs with KV-cache."""
+    if phase in ("prefill", "e2e"):
+        set_cache_length(past_key_values, 0)
+    elif phase == "decode":
+        set_cache_length(past_key_values, prompt_length)
+
     torch.cuda.synchronize(device)
     torch.cuda.reset_peak_memory_stats(device)
 
@@ -123,11 +142,13 @@ def measure_phase(
     if phase == "prefill":
         prefill_graph.replay()
     elif phase == "decode":
-        for _ in range(decode_tokens):
+        for step in range(decode_tokens):
+            decode_pos.fill_(prompt_length + step)
             decode_graph.replay()
     elif phase == "e2e":
         prefill_graph.replay()
-        for _ in range(decode_tokens):
+        for step in range(decode_tokens):
+            decode_pos.fill_(prompt_length + step)
             decode_graph.replay()
 
     end_event.record()
@@ -164,6 +185,8 @@ def main() -> None:
     if device.type != "cuda" or not torch.cuda.is_available():
         raise RuntimeError("Error: Runtime benchmark requires a CUDA device.")
     torch.cuda.set_device(device)
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
 
     print("Querying model sizes...")
     sizes = {m: get_size(m) for m in args.models}
@@ -209,32 +232,83 @@ def main() -> None:
                 model_id, dtype=torch.float16, device_map="cpu", trust_remote_code=True
             ).eval()
 
-            replace_layers(model, method, TARGET_LAYERS, bits=4, group_size=128)
-            model = model.to(device)
+            model.config.sliding_window = None
+            if hasattr(model.config, "use_sliding_window"):
+                model.config.use_sliding_window = False
+            if hasattr(model.config, "layer_types") and model.config.layer_types is not None:
+                model.config.layer_types = ["full_attention"] * model.config.num_hidden_layers
 
+            replace_layers(model, method, TARGET_LAYERS, bits=4, group_size=128)
+
+            # Move and pack INT4 weights layer-by-layer to avoid intermediate INT8 VRAM spike on 8B
             for _, module in model.named_modules():
                 if isinstance(module, QuantizedLinear):
+                    module.to(device)
                     module.enable_cutlass()
+            model = model.to(device)
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            max_cache_len = args.prompt_length + args.decode_tokens
+            past_key_values = StaticCache(
+                config=model.config,
+                max_cache_len=max_cache_len,
+            )
 
             generator = torch.Generator(device=device).manual_seed(0)
             prompt_ids = torch.randint(0, vocab_size, (1, args.prompt_length), device=device, generator=generator)
             decode_id = torch.randint(0, vocab_size, (1, 1), device=device, generator=generator)
+            prefill_pos = torch.arange(0, args.prompt_length, device=device, dtype=torch.long)
+            decode_pos = torch.tensor([args.prompt_length], device=device, dtype=torch.long)
 
             with torch.inference_mode():
-                # Warmup allocator
-                for _ in range(args.warmup):
-                    model(input_ids=prompt_ids, use_cache=False)
-                    model(input_ids=decode_id, use_cache=False)
+                # Single warmup pass to lazily allocate StaticCache on GPU
+                set_cache_length(past_key_values, 0)
+                model(
+                    input_ids=prompt_ids,
+                    past_key_values=past_key_values,
+                    cache_position=prefill_pos,
+                    use_cache=True,
+                )
+                set_cache_length(past_key_values, args.prompt_length)
+                decode_pos.fill_(args.prompt_length)
+                model(
+                    input_ids=decode_id,
+                    past_key_values=past_key_values,
+                    cache_position=decode_pos,
+                    use_cache=True,
+                )
                 torch.cuda.synchronize(device)
 
-                # Initialize graphs
-                prefill_graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(prefill_graph):
-                    model(input_ids=prompt_ids, use_cache=False)
+                # Release default allocator blocks before capturing into shared CUDAGraph pool
+                gc.collect()
+                torch.cuda.empty_cache()
+                graph_pool = torch.cuda.graph_pool_handle()
 
+                # Capture prefill graph
+                set_cache_length(past_key_values, 0)
+                prefill_graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(prefill_graph, pool=graph_pool):
+                    model(
+                        input_ids=prompt_ids,
+                        past_key_values=past_key_values,
+                        cache_position=prefill_pos,
+                        use_cache=True,
+                    )
+
+                # Capture decode graph sharing the same memory pool
+                set_cache_length(past_key_values, args.prompt_length)
+                decode_pos.fill_(args.prompt_length)
                 decode_graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(decode_graph):
-                    model(input_ids=decode_id, use_cache=False)
+                with torch.cuda.graph(decode_graph, pool=graph_pool):
+                    model(
+                        input_ids=decode_id,
+                        past_key_values=past_key_values,
+                        cache_position=decode_pos,
+                        use_cache=True,
+                    )
+
+                torch.cuda.empty_cache()
 
                 # Bench phases
                 for phase in PHASES:
@@ -242,13 +316,19 @@ def main() -> None:
 
                     # Warmup execution
                     for _ in range(args.warmup):
-                        measure_phase(prefill_graph, decode_graph, phase, args.decode_tokens, device)
+                        measure_phase(
+                            prefill_graph, decode_graph, past_key_values, decode_pos,
+                            args.prompt_length, phase, args.decode_tokens, device
+                        )
 
                     # Measure
                     times_ms = []
                     peaks_bytes = []
                     for _ in range(args.repeats):
-                        ms, peak = measure_phase(prefill_graph, decode_graph, phase, args.decode_tokens, device)
+                        ms, peak = measure_phase(
+                            prefill_graph, decode_graph, past_key_values, decode_pos,
+                            args.prompt_length, phase, args.decode_tokens, device
+                        )
                         times_ms.append(ms)
                         peaks_bytes.append(peak)
 
@@ -280,7 +360,11 @@ def main() -> None:
 
             del prefill_graph
             del decode_graph
+            del graph_pool
+            del past_key_values
+            del prompt_ids, decode_id, prefill_pos, decode_pos
             del model
+            gc.collect()
             torch.cuda.empty_cache()
 
     print(f"\nBenchmark finished: {len(records)} records.")
