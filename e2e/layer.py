@@ -222,15 +222,10 @@ class PerGroupQuantizedLinear(QuantizedLinear):
             stream = torch.cuda.current_stream(x.device).cuda_stream
             get_lib().cutlass_pgmm(ptr(x), ptr(self.weight_q), ptr(self.group_scales), ptr(out), m, n, k, stream)
             return self._add_bias(out)
-        original_shape = x.shape[:-1]
-        groups = self.group_scales.size(0)
-        flat_x = x.reshape(-1, groups, self.group_size)
-        x_groups = flat_x.transpose(0, 1)
-        weight_groups = self.weight_q.reshape(self.weight_q.size(0), groups, self.group_size)
-        weight_groups = weight_groups.permute(1, 2, 0).to(x.dtype)
-        group_outputs = torch.matmul(x_groups, weight_groups).permute(1, 0, 2)
-        output = (group_outputs * self.group_scales.unsqueeze(0)).sum(dim=1)
-        return self._add_bias(output.reshape(*original_shape, -1))
+        n, k = self.weight_q.shape
+        w_fp = self.weight_q.to(x.dtype)
+        w_fp.view(n, -1, self.group_size).mul_(self.group_scales.t().unsqueeze(-1))
+        return self._add_bias(torch.matmul(x, w_fp.t()))
 
 
 class LRSRNaiveQuantizedLinear(QuantizedLinear):
